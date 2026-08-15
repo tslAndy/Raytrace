@@ -1,0 +1,799 @@
+#pragma kernel CSMain
+
+#pragma multi_compile __ RIS_ON
+#pragma multi_compile __ GLOBAL_BVH_ON
+
+// STRUCTS
+struct Mesh {
+  int bvhHead;
+  int trigStart, trigCount; // used for lighting
+};
+
+struct Model {
+  float3 boxMin, boxMax;
+  int meshIndex, materialIndex;
+};
+
+struct NodeBVH {
+  float3 min, max;
+  int start, end; // if start < 0 then treated as childIndex = -start
+};
+
+struct Hit {
+  float3 pos, norm;
+  float dist;
+  bool backface;
+
+  uint materialIndex;
+  // float2 uv;
+};
+
+struct NodeStack {
+  int nodeIndex, depth;
+  float dist;
+};
+
+struct Material {
+  float data[15];
+  int flag;
+};
+
+struct DiffuseMaterial {
+  float3 mainColor;     // 0 1 2
+  float3 specularColor; // 3 4 5
+  float3 emissionColor; // 6 7 8
+
+  float smooth;   // 9
+  float specular; // 10
+  float emission; // 11
+};
+
+struct GlassMaterial {
+  float ior;                 // 0
+  float transmittionDiffuse; // 1
+  float reflectionDiffuse;   // 2
+  float absorption;          // 3
+
+  float3 absorptionColor; // 4 5 6
+};
+
+// RAYTRACE PARAMS
+RWTexture2D<float4> result;
+
+uint2 resolution;
+int maxBounces;
+int samples;
+int tileSize;
+
+float3 cameraPosition;
+float4x4 cameraMatrix;
+
+uint frameIndex;
+uint randOffset;
+uint offsetX, offsetY;
+
+// SHARED MODELS DATA
+StructuredBuffer<float3> vertices;
+StructuredBuffer<int> triangles;
+StructuredBuffer<Mesh> meshes;
+StructuredBuffer<NodeBVH> bvh;
+
+StructuredBuffer<Material> materials;
+
+// UNSHARED MODELS DATA
+StructuredBuffer<Model> models;
+StructuredBuffer<float4x4> localToWorldMatrices;
+StructuredBuffer<float4x4> worldToLocalMatrices;
+StructuredBuffer<NodeBVH> globalBvh;
+
+// LIGHTING DATA
+StructuredBuffer<int> lightsId; // indices of light models
+
+// ----------------------- CONSTANTS -------------------------
+
+#define PI 3.14159265359
+#define INV_PI 1.0 / PI
+#define EPS 0.001
+#define FLOAT_MAX 1e10
+#define IOR_AIR 1.0
+
+#define LIGHT_SAMPLES 5
+#define MAX_BVH_DEPTH 10
+
+// looks like enums aren't supportted here
+#define MATERIAL_DIFFUSE 0
+#define MATERIAL_GLASS 1
+
+// ----------------------- RANDOM GENERATORS -------------------------
+uint hash(uint seed) {
+  seed = seed * 747796405u + 2891336453u;
+  seed = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+  return (seed >> 22u) ^ seed;
+}
+
+float rand(inout uint seed) {
+  return float(hash(seed++)) * (1.0 / 4294967296.0);
+}
+
+uint randInt(uint minValue, uint maxValue, inout uint seed) {
+  return uint(lerp(float(minValue), float(maxValue) - 0.990, rand(seed)));
+}
+
+float3 randVecCosine(float3 norm, inout uint seed) {
+  float t1 = rand(seed);
+  float t2 = rand(seed);
+
+  float y = sqrt(1.0 - t2);
+  float k = sqrt(t2);
+  float x = cos(2.0 * PI * t1) * k;
+  float z = sin(2.0 * PI * t1) * k;
+
+  float3 other = all(abs(abs(norm) - float3(1.0, 0.0, 0.0)) < EPS)
+                     ? float3(0.0, 1.0, 0.0)
+                     : float3(1.0, 0.0, 0.0);
+  float3 right = normalize(cross(norm, other));
+  float3 forw = cross(right, norm);
+
+  float3 vec = y * norm + x * right + z * forw;
+  return vec;
+}
+
+float3 randVecUniform(float3 norm, inout uint seed) {
+  float t1 = rand(seed);
+  float t2 = rand(seed);
+
+  float y = abs(1.0 - 2.0 * t2);
+  float k = 2.0 * sqrt(t2 * (1 - t2));
+  float x = cos(2.0 * PI * t1) * k;
+  float z = sin(2.0 * PI * t1) * k;
+
+  float3 other = all(abs(abs(norm) - float3(1.0, 0.0, 0.0)) < EPS)
+                     ? float3(0.0, 1.0, 0.0)
+                     : float3(1.0, 0.0, 0.0);
+  float3 right = normalize(cross(norm, other));
+  float3 forw = cross(right, norm);
+
+  float3 vec = y * norm + x * right + z * forw;
+  return vec;
+}
+
+// ----------------------- Materials Convertors -------------------------
+// PAIN IN MY ASSHOLES, WHEN I STARTED THIS
+// I THOUGHT STRUCTURES CAN BE EASILY CASTED TO ANOTHER BY BYTES LIKE IN C
+GlassMaterial ConvertToGlassMaterial(Material material) {
+  float d[15] = material.data;
+
+  GlassMaterial glassMat = {
+    d[0],                    // ior
+    d[1],                    // transmittionDiffuse
+    d[2],                    // reflectionDiffuse
+    d[3],                    // absorption
+    float3(d[4], d[5], d[6]) // absorption color
+  };
+
+  return glassMat;
+}
+
+DiffuseMaterial ConvertToDiffuseMaterial(Material material) {
+  float d[15] = material.data;
+
+  DiffuseMaterial diffuseMat = {
+    float3(d[0], d[1], d[2]), // main color
+    float3(d[3], d[4], d[5]), // specular color
+    float3(d[6], d[7], d[8]), // emission color
+
+    d[9],  // smooth
+    d[10], // specular
+    d[11]  // emission
+  };
+
+  return diffuseMat;
+}
+
+// ----------------------- RAYCASTING -------------------------
+bool RaycastTrig(float3 pos, float3 dir, int trigId, float dist, out Hit hit) {
+  hit = (Hit)0;
+
+  int indA = triangles[trigId];
+  int indB = triangles[trigId + 1];
+  int indC = triangles[trigId + 2];
+
+  float3 a = vertices[indA];
+  float3 b = vertices[indB];
+  float3 c = vertices[indC];
+
+  float3 surfVec = cross(b - a, c - b);
+
+  float div = dot(dir, surfVec);
+  if (abs(div) < EPS)
+    return false;
+
+  float t = dot(a - pos, surfVec) / div;
+  if (t <= EPS || t >= dist)
+    return false;
+
+  float3 onTrig = pos + dir * t;
+  float uvA = dot(cross(onTrig - b, a - onTrig), surfVec);
+  float uvB = dot(cross(onTrig - a, c - onTrig), surfVec);
+  float uvC = dot(cross(onTrig - c, b - onTrig), surfVec);
+
+  if (uvA < 0.0 || uvB < 0.0 || uvC < 0.0)
+    return false;
+
+  // float uvFactor = 1.0 / dot(surfVec, surfVec);
+  // uvA *= uvFactor;
+  // uvB *= uvFactor;
+  // uvC *= uvFactor;
+  // hit.uv = float2(0, 0) * uvA + float2(1, 0) * uvB + float2(1, 1) * uvC;
+
+  hit.pos = onTrig;
+  hit.norm = normalize(surfVec);
+  hit.dist = max(t, EPS);
+  hit.backface = div > 0.0;
+
+  return true;
+}
+
+bool RaycastBox(float3 pos, float3 dir, float3 boxMin, float3 boxMax,
+                out float dist) {
+  dist = FLOAT_MAX;
+
+  if (all(boxMin <= pos) && all(pos <= boxMax)) {
+    dist = 0.0;
+    return true;
+  }
+
+  float3 invDir = 1.0 / dir;
+
+  dist = FLOAT_MAX;
+  for (int i = 0; i < 3; i++) {
+    if (abs(dir[i]) < EPS)
+      continue;
+
+    if ((pos[i] < boxMin[i] && dir[i] < 0.0) ||
+        (pos[i] > boxMax[i] && dir[i] > 0.0))
+      continue;
+
+    float delta = (dir[i] > 0.0 ? boxMin[i] : boxMax[i]) - pos[i];
+    float t = delta * invDir[i];
+    if (t > dist)
+      continue;
+
+    float3 pnt = pos + dir * t;
+    if (all((boxMin - EPS) < pnt) && all(pnt < (boxMax + EPS)))
+      dist = t;
+  }
+
+  return dist < FLOAT_MAX - EPS;
+}
+
+bool RaycastModel(float3 pos, float3 dir, int modelIndex, out Hit hit) {
+  hit = (Hit)0;
+  hit.dist = FLOAT_MAX;
+
+  float3 origPos = pos;
+
+  Model model = models[modelIndex];
+  float4x4 worldToLocal = worldToLocalMatrices[modelIndex];
+
+  pos = mul(worldToLocal, float4(pos, 1.0));
+  dir = normalize(mul(worldToLocal, float4(dir, 0.0)));
+
+  NodeStack stack[MAX_BVH_DEPTH];
+  stack[0].nodeIndex = meshes[model.meshIndex].bvhHead;
+  stack[0].depth = 0;
+  stack[0].dist = 0.0;
+
+  int index = 1;
+  while (index > 0) {
+    NodeStack nodeStack = stack[--index];
+    if (nodeStack.dist > hit.dist)
+      continue;
+
+    NodeBVH nodeBvh = bvh[nodeStack.nodeIndex];
+
+    // leaf, check triangles
+    if (nodeBvh.start >= 0) {
+      for (int trigId = nodeBvh.start; trigId < nodeBvh.end; trigId += 3) {
+        Hit tempHit;
+        if (RaycastTrig(pos, dir, trigId, hit.dist, tempHit))
+          hit = tempHit;
+      }
+      continue;
+    }
+
+    // branch
+    int childIdA = -nodeBvh.start;
+    int childIdB = -nodeBvh.start + 1;
+
+    NodeBVH childA = bvh[childIdA];
+    NodeBVH childB = bvh[childIdB];
+
+    float distA, distB;
+    bool overlapA = RaycastBox(pos, dir, childA.min, childA.max, distA);
+    bool overlapB = RaycastBox(pos, dir, childB.min, childB.max, distB);
+
+    overlapA = overlapA && (distA < hit.dist);
+    overlapB = overlapB && (distB < hit.dist);
+
+    NodeStack nodeStackA = { childIdA, nodeStack.depth + 1, distA };
+    NodeStack nodeStackB = { childIdB, nodeStack.depth + 1, distB };
+
+    if (overlapA && overlapB) {
+      if (distA <= distB) {
+        stack[index++] = nodeStackA;
+        stack[index++] = nodeStackB;
+      } else {
+        stack[index++] = nodeStackB;
+        stack[index++] = nodeStackA;
+      }
+    } else if (overlapA) {
+      stack[index++] = nodeStackA;
+    } else if (overlapB) {
+      stack[index++] = nodeStackB;
+    }
+  }
+
+  if (hit.dist >= FLOAT_MAX - EPS)
+    return false;
+
+  float4x4 localToWorld = localToWorldMatrices[modelIndex];
+
+  hit.materialIndex = model.materialIndex;
+  hit.pos = mul(localToWorld, float4(hit.pos, 1.0));
+  hit.norm = normalize(mul(localToWorld, float4(hit.norm, 0.0)));
+  hit.dist = length(hit.pos - origPos);
+  return true;
+}
+
+bool RaycastWorld(float3 pos, float3 dir, out Hit hit) {
+  hit = (Hit)0;
+  hit.dist = FLOAT_MAX;
+
+  uint modelsCount, _;
+  models.GetDimensions(modelsCount, _);
+  for (int modelIndex = 0; modelIndex < modelsCount; modelIndex++) {
+    Model model = models[modelIndex];
+
+    float tempDist;
+    if ((!RaycastBox(pos, dir, model.boxMin, model.boxMax, tempDist)) ||
+        (tempDist >= hit.dist))
+      continue;
+
+    Hit tempHit;
+    if (RaycastModel(pos, dir, modelIndex, tempHit) &&
+        (tempHit.dist < hit.dist))
+      hit = tempHit;
+  }
+  return hit.dist < FLOAT_MAX - EPS;
+}
+
+bool RaycastWorldBVH(float3 pos, float3 dir, out Hit hit) {
+  hit = (Hit)0;
+  hit.dist = FLOAT_MAX;
+
+  NodeStack stack[MAX_BVH_DEPTH];
+  stack[0] = (NodeStack)0;
+
+  int index = 1;
+  while (index > 0 && index <= MAX_BVH_DEPTH) {
+    NodeStack nodeStack = stack[--index];
+    if (nodeStack.dist > hit.dist)
+      continue;
+
+    NodeBVH nodeBvh = globalBvh[nodeStack.nodeIndex];
+
+    // leaf
+    if (nodeBvh.start >= 0) {
+      for (int modelIndex = nodeBvh.start; modelIndex < nodeBvh.end;
+           modelIndex++) {
+
+        Model model = models[modelIndex];
+
+        float tempDist;
+        if ((!RaycastBox(pos, dir, model.boxMin, model.boxMax, tempDist)) ||
+            (tempDist >= hit.dist))
+          continue;
+
+        Hit tempHit;
+        if (RaycastModel(pos, dir, modelIndex, tempHit) &&
+            (tempHit.dist < hit.dist))
+          hit = tempHit;
+      }
+      continue;
+    }
+
+    // branch
+    int childIdA = -nodeBvh.start;
+    int childIdB = -nodeBvh.start + 1;
+
+    NodeBVH childA = globalBvh[childIdA];
+    NodeBVH childB = globalBvh[childIdB];
+
+    float distA, distB;
+    bool overlapA = RaycastBox(pos, dir, childA.min, childA.max, distA);
+    bool overlapB = RaycastBox(pos, dir, childB.min, childB.max, distB);
+    overlapA = overlapA && (distA < hit.dist);
+    overlapB = overlapB && (distB < hit.dist);
+
+    NodeStack nodeStackA = { childIdA, nodeStack.depth + 1, distA };
+    NodeStack nodeStackB = { childIdB, nodeStack.depth + 1, distB };
+
+    if (overlapA && overlapB) {
+      if (distA <= distB) {
+        stack[index++] = nodeStackA;
+        stack[index++] = nodeStackB;
+      } else {
+        stack[index++] = nodeStackB;
+        stack[index++] = nodeStackA;
+      }
+    } else if (overlapA) {
+      stack[index++] = nodeStackA;
+    } else if (overlapB) {
+      stack[index++] = nodeStackB;
+    }
+  }
+  return hit.dist < FLOAT_MAX - EPS;
+}
+
+// ----------------------- NEXT EVENT ESTIMATION -------------------------
+void SampleRandomLight(float3 pos, float3 norm, inout uint seed,
+                       out float3 color, out float pdf) {
+  color = 0.0;
+  pdf = EPS;
+
+  uint lightsCount, _;
+  lightsId.GetDimensions(lightsCount, _);
+
+  int modelIndex = lightsId[randInt(0, lightsCount, seed)];
+
+  Model model = models[modelIndex];
+  Mesh mesh = meshes[model.meshIndex];
+
+  int trigId = mesh.trigStart + randInt(0, mesh.trigCount, seed) * 3;
+  int indA = triangles[trigId];
+  int indB = triangles[trigId + 1];
+  int indC = triangles[trigId + 2];
+
+  float4x4 localToWorldMatrix = localToWorldMatrices[modelIndex];
+  float3 a = vertices[indA];
+  float3 b = vertices[indB];
+  float3 c = vertices[indC];
+
+  a = mul(localToWorldMatrix, float4(a, 1.0));
+  b = mul(localToWorldMatrix, float4(b, 1.0));
+  c = mul(localToWorldMatrix, float4(c, 1.0));
+
+  float r1 = rand(seed);
+  float r2 = rand(seed);
+
+  if (r1 + r2 > 1.0) {
+    r1 = 1.0 - r1;
+    r2 = 1.0 - r2;
+  }
+
+  float3 onTrig = a * r1 + b * r2 + c * (1.0 - r1 - r2);
+  float3 surfVec = cross(b - a, c - b);
+  float3 delta = onTrig - pos;
+
+  if (dot(delta, surfVec) >= 0.0 || dot(delta, norm) <= 0.0 ||
+      dot(delta, delta) < EPS) {
+    return;
+  }
+
+  float dist = max(length(delta), EPS);
+  delta /= dist;
+
+  Hit hit;
+#if GLOBAL_BVH_ON
+  if ((!RaycastWorldBVH(pos, delta, hit)) || abs(hit.dist - dist) > EPS)
+    return;
+#else
+  if ((!RaycastWorld(pos, delta, hit)) || abs(hit.dist - dist) > EPS)
+    return;
+#endif
+
+  float area = max(length(surfVec), EPS);
+  surfVec /= area;
+
+  float tempPdf = (1.0 / lightsCount) * (1.0 / mesh.trigCount) * (2.0 / area);
+  float gFactor =
+      dot(delta, norm) * dot(-delta, surfVec) * (1.0 / (dist * dist + 0.5));
+
+  DiffuseMaterial material =
+      ConvertToDiffuseMaterial(materials[model.materialIndex]);
+
+  color = material.emission * material.emissionColor * gFactor;
+  pdf = tempPdf;
+}
+
+void SampleRandomLightRIS(float3 pos, float3 norm, inout uint seed,
+                          out float3 color, out float pdf) {
+  color = 0.0;
+  pdf = EPS;
+
+  uint lightsCount, _;
+  lightsId.GetDimensions(lightsCount, _);
+
+  float weights[LIGHT_SAMPLES];
+  float pdfs[LIGHT_SAMPLES];
+
+  float3 points[LIGHT_SAMPLES];
+  float3 colors[LIGHT_SAMPLES];
+
+  int samples = LIGHT_SAMPLES;
+
+  int i = 0;
+  while (i < samples) {
+    int modelIndex = lightsId[randInt(0, lightsCount, seed)];
+
+    Model model = models[modelIndex];
+    Mesh mesh = meshes[model.meshIndex];
+
+    int trigId = mesh.trigStart + randInt(0, mesh.trigCount, seed) * 3;
+    int indA = triangles[trigId];
+    int indB = triangles[trigId + 1];
+    int indC = triangles[trigId + 2];
+
+    float4x4 localToWorldMatrix = localToWorldMatrices[modelIndex];
+    float3 a = vertices[indA];
+    float3 b = vertices[indB];
+    float3 c = vertices[indC];
+
+    a = mul(localToWorldMatrix, float4(a, 1.0));
+    b = mul(localToWorldMatrix, float4(b, 1.0));
+    c = mul(localToWorldMatrix, float4(c, 1.0));
+
+    float r1 = rand(seed);
+    float r2 = rand(seed);
+
+    if (r1 + r2 > 1.0) {
+      r1 = 1.0 - r1;
+      r2 = 1.0 - r2;
+    }
+
+    float3 onTrig = a * r1 + b * r2 + c * (1.0 - r1 - r2);
+
+    float3 surfVec = cross(b - a, c - b);
+    float3 delta = onTrig - pos;
+
+    if (dot(delta, surfVec) >= 0.0 || dot(delta, norm) <= 0.0 ||
+
+        dot(delta, delta) < EPS) {
+      samples--;
+      continue;
+    }
+
+    float area = max(length(surfVec), EPS);
+    float dist = max(length(delta), EPS);
+
+    surfVec /= area;
+    delta /= dist;
+
+    float tempPdf = (1.0 / lightsCount) * (1.0 / mesh.trigCount) * (2.0 / area);
+
+    float gFactor =
+        dot(delta, norm) * dot(-delta, surfVec) * (2.0 / (dist * dist + 1.0));
+
+    DiffuseMaterial material =
+        ConvertToDiffuseMaterial(materials[model.materialIndex]);
+
+    weights[i] = material.emission * gFactor / tempPdf;
+    pdfs[i] = tempPdf;
+
+    points[i] = onTrig;
+    colors[i] = material.emission * material.emissionColor * gFactor;
+
+    i++;
+  }
+
+  if (samples == 0)
+    return;
+
+  float weightSum = 0.0;
+  i = 0;
+  while (i < samples)
+    weightSum += weights[i++];
+  float invWeightSum = 1.0 / max(weightSum, EPS);
+
+  float rnd = rand(seed);
+  float accum = 0.0;
+
+  i = 0;
+  while (i < samples) {
+    accum += weights[i] * invWeightSum;
+    if (rnd > accum) {
+      i++;
+      continue;
+    }
+
+    float3 delta = points[i] - pos;
+    float dist = max(length(delta), EPS);
+    delta /= dist;
+
+    Hit hit;
+#if GLOBAL_BVH_ON
+    if ((!RaycastWorldBVH(pos, delta, hit)) || abs(hit.dist - dist) > EPS)
+      return;
+#else
+    if ((!RaycastWorld(pos, delta, hit)) || abs(hit.dist - dist) > EPS)
+      return;
+#endif
+
+    // correction by average value
+    // corr = (weightSum / samples) / (weights[i]) 
+    float corr = weightSum / (samples * weights[i]);
+    pdf = pdfs[i] * corr;
+    color = colors[i];
+
+    return;
+  }
+}
+
+// ----------------------- Materials Handlers -------------------------
+void HandleDiffuseMaterial(Hit hit, inout float3 pos, inout float3 dir,
+                           out float3 light, out float3 color,
+                           bool isFirstBounce, inout uint seed) {
+  DiffuseMaterial material =
+      ConvertToDiffuseMaterial(materials[hit.materialIndex]);
+  bool isSpec = rand(seed) < material.specular;
+
+  float3 emission = material.emission * material.emissionColor;
+
+  float specProb = isSpec ? material.specular : (1.0 - material.specular);
+  float smoothProb = isSpec ? 1.0 : (1.0 - material.smooth);
+  float angleProb = isFirstBounce ? 1.0 : (dot(-dir, hit.norm) * INV_PI);
+  float directPdf = 1.0 / max(specProb * smoothProb * angleProb, EPS);
+
+  float3 indirectLight = 0.0;
+  float indirectPdf = 0.0;
+
+#if RIS_ON
+  SampleRandomLightRIS(hit.pos + hit.norm * EPS, hit.norm, seed, indirectLight,
+                       indirectPdf);
+#else
+  SampleRandomLight(hit.pos + hit.norm * EPS, hit.norm, seed, indirectLight,
+                    indirectPdf);
+#endif
+
+  float weightDirect = directPdf / (directPdf + indirectPdf);
+  float weightIndirect = 1.0 - weightDirect;
+
+  color = isSpec ? material.specularColor : material.mainColor;
+  light = emission * weightDirect + indirectLight * color * weightIndirect;
+
+  float3 randNorm = randVecCosine(hit.norm, seed);
+  float3 norm =
+      isSpec ? normalize(lerp(randNorm, hit.norm, material.smooth)) : randNorm;
+
+  dir = reflect(dir, norm);
+  if (dot(dir, hit.norm) < 0.0)
+    dir = -dir;
+  pos = hit.pos + hit.norm * EPS;
+}
+
+void HandleGlassMaterial(Hit hit, inout float3 pos, inout float3 dir,
+                         out float3 light, out float3 color, inout uint seed) {
+  light = 0.0;
+  color = 1.0;
+
+  GlassMaterial material = ConvertToGlassMaterial(materials[hit.materialIndex]);
+
+  float n1, n2;
+  float3 norm;
+
+  if (hit.backface) {
+    n1 = material.ior;
+    n2 = IOR_AIR;
+    norm = -hit.norm;
+    color *= exp(-hit.dist * material.absorptionColor * material.absorption);
+  } else {
+    n1 = IOR_AIR;
+    n2 = material.ior;
+    norm = hit.norm;
+  }
+
+  float3 transmitted = refract(dir, norm, n1 / n2);
+  // internal reflection
+  if (dot(transmitted, transmitted) < EPS) {
+    float3 reflected = reflect(dir, norm);
+    dir = normalize(lerp(randVecUniform(reflected, seed), reflected,
+                         1.0 - material.transmittionDiffuse));
+    if (dot(dir, norm) < 0.0)
+      dir = reflect(-dir, reflected);
+    pos = hit.pos + norm * EPS;
+    return;
+  }
+
+  float cos_in = dot(-dir, norm);
+  float cos_out = dot(-transmitted, norm);
+
+  float f1 = (n2 * cos_in - n1 * cos_out) / (n2 * cos_in + n1 * cos_out);
+  float f2 = (n1 * cos_in - n2 * cos_out) / (n1 * cos_in + n2 * cos_out);
+
+  float probReflection = 0.5 * (f1 + f2);
+  // external reflection
+  if (rand(seed) < probReflection) {
+    float3 reflected = reflect(dir, norm);
+    dir = normalize(lerp(randVecCosine(reflected, seed), reflected,
+                         1.0 - material.reflectionDiffuse));
+    if (dot(dir, norm) < 0.0)
+      dir = reflect(-dir, reflected);
+    pos = hit.pos + norm * EPS;
+  }
+  // transmittion
+  else {
+    dir = normalize(lerp(randVecUniform(transmitted, seed), transmitted,
+                         1.0 - material.transmittionDiffuse));
+    if (dot(dir, norm) > 0.0)
+      dir = reflect(-dir, transmitted);
+    pos = hit.pos - norm * EPS;
+  }
+}
+
+// ----------------------- MAIN -------------------------
+float3 Trace(float3 pos, float3 dir, inout uint seed) {
+  float3 rayColor = 1.0;
+  float3 accum = 0.0;
+
+  for (int i = 0; i < maxBounces; i++) {
+    Hit hit;
+
+#if GLOBAL_BVH_ON
+    if (!RaycastWorldBVH(pos, dir, hit))
+      break;
+#else
+    if (!RaycastWorld(pos, dir, hit))
+      break;
+#endif
+
+    float3 light = 0.0;
+    float3 color = 0.0;
+
+    Material material = materials[hit.materialIndex];
+    switch (material.flag) {
+    case MATERIAL_DIFFUSE:
+      if (hit.backface)
+        return accum;
+      HandleDiffuseMaterial(hit, pos, dir, light, color, i == 0, seed);
+      break;
+
+    case MATERIAL_GLASS:
+      HandleGlassMaterial(hit, pos, dir, light, color, seed);
+      break;
+
+    default:
+      break;
+    }
+
+    accum += rayColor * light;
+    rayColor *= color;
+  }
+  return accum;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id: SV_DispatchThreadID) {
+  if (id.x >= tileSize || id.y >= tileSize)
+    return;
+
+  id.x += offsetX;
+  id.y += offsetY;
+  if (id.x >= resolution.x || id.y >= resolution.y)
+    return;
+
+  uint seed = hash(id.y * resolution.x + id.x) + randOffset;
+
+  float3 pos = cameraPosition;
+  float3 total = 0.0;
+  for (int i = 0; i < samples; i++) {
+    float3 dir = normalize(mul(
+        cameraMatrix, float4(id.x + rand(seed), id.y + rand(seed), 1.0, 1.0)));
+    total += Trace(pos, dir, seed);
+  }
+  total *= 1.0 / samples;
+
+  float3 col = (result[id.xy] * frameIndex + total) / (frameIndex + 1.0);
+  result[id.xy] = float4(col, 1.0);
+}
+

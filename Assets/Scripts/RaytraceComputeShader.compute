@@ -1,0 +1,300 @@
+#pragma kernel CSMain
+
+// ----------------------- STRUCTS -------------------------
+struct Mat {
+  float4 color;
+  float smooth;
+
+  float4 glossyColor;
+  float glossy;
+
+  float4 emission;
+  float emissionStrength;
+};
+
+struct Trig {
+  int indA, indB, indC;
+  int modelIndex;
+};
+
+struct EmissiveInfo {
+  int trigIndex, trigCount;
+};
+
+struct Hit {
+  float3 pos, norm;
+  float dist;
+
+  float2 uv;
+  uint modelIndex;
+};
+
+// ----------------------- MAIN PARAMS -------------------------
+uint2 resolution;
+int maxBounces;
+int samples;
+
+float3 cameraPosition;
+float4x4 cameraMatrix;
+
+uint frameIndex;
+
+// ----------------------- BUFFERS, TEXTURES -------------------------
+RWTexture2D<float4> result;
+
+StructuredBuffer<float3> vertices;
+StructuredBuffer<float3> normals;
+StructuredBuffer<float4x4> matrices;
+StructuredBuffer<Trig> triangles;
+StructuredBuffer<Mat> materials;
+StructuredBuffer<EmissiveInfo> emissiveInfo;
+
+// ----------------------- CONSTANTS -------------------------
+#define PI 3.14159265359
+#define EPS 0.00001
+#define FLOAT_MAX 1e10
+#define SEMISPHERE_AREA 2.0 * PI
+
+// ----------------------- RANDOM GENERATORS -------------------------
+
+uint hash(uint seed) {
+  seed = (seed ^ 61) ^ (seed >> 16);
+  seed *= 9;
+  seed = seed ^ (seed >> 4);
+  seed *= 0x27d4eb2d;
+  seed = seed ^ (seed >> 15);
+  return seed;
+}
+
+uint comb_hash(uint a, uint b) {
+  uint state = hash(a) ^ hash(b);
+  state ^= (state << 13);
+  state ^= (state >> 17);
+  state ^= (state << 5);
+  return state;
+}
+
+float rand(inout uint seed) {
+  return float(hash(seed++)) * (1.0 / 4294967296.0);
+}
+
+uint randInt(uint minValue, uint maxValue, inout uint seed) {
+  return uint(lerp(float(minValue), float(maxValue) - EPS, rand(seed)));
+}
+
+float3 randVec(float3 norm, float deviation, inout uint seed) {
+  float t1 = rand(seed);
+  float t2 = rand(seed);
+
+  float y = 1.0 - t2 * (1.0 - cos(0.5 * PI * deviation));
+  float a = sqrt(1.0 - y * y);
+  float b = 2.0 * PI * t1;
+  float x = a * cos(b);
+  float z = a * sin(b);
+
+  float3 other = all(abs(abs(norm) - float3(1.0, 0.0, 0.0)) < EPS)
+                     ? float3(0.0, 1.0, 0.0)
+                     : float3(1.0, 0.0, 0.0);
+  float3 right = normalize(cross(norm, other));
+  float3 forw = cross(right, norm);
+
+  float3 vec = y * norm + x * right + z * forw;
+  return vec;
+}
+
+// ----------------------- MAIN -------------------------
+
+bool Overlap(float3 pos, float3 dir, float minDist, int trigIndex,
+             bool detectBackface, out Hit hit) {
+  hit = (Hit)0;
+
+  Trig trig = triangles[trigIndex];
+
+  float4x4 mat = matrices[trig.modelIndex];
+  float3 a = mul(mat, float4(vertices[trig.indA], 1.0));
+  float3 b = mul(mat, float4(vertices[trig.indB], 1.0));
+  float3 c = mul(mat, float4(vertices[trig.indC], 1.0));
+
+  float3 surfVec = cross(b - a, c - b);
+
+  // TODO: проверить  работает если луч идет с обратной стороны
+  //
+  float div = dot(dir, surfVec);
+  if (abs(div) < EPS)
+    return false;
+
+  if (div > 0 && !detectBackface)
+    return false;
+
+  float t = dot(a - pos, surfVec) / div;
+  if (t < 0.0 || t > minDist)
+    return false;
+
+  float3 onTrig = pos + dir * t;
+  float uvA = dot(cross(onTrig - b, a - onTrig), surfVec);
+  float uvB = dot(cross(onTrig - a, c - onTrig), surfVec);
+  float uvC = dot(cross(onTrig - c, b - onTrig), surfVec);
+
+  if (uvA < 0.0 || uvB < 0.0 || uvC < 0.0)
+    return false;
+
+  float uvFactor = 1.0 / dot(surfVec, surfVec);
+  uvA *= uvFactor;
+  uvB *= uvFactor;
+  uvC *= uvFactor;
+
+  hit.pos = onTrig;
+  hit.norm = normalize(surfVec);
+  // hit.norm = normalize(uvA * normals[trig.indA] + uvB * normals[trig.indB] +
+  //                      uvC * normals[trig.indC]);
+  hit.norm = normalize(surfVec);
+  hit.dist = max(t, EPS);
+  hit.modelIndex = trig.modelIndex;
+
+  // TODO FIX TO REAL UV
+  hit.uv = float2(0, 0) * uvA + float2(1, 0) * uvB + float2(1, 1) * uvC;
+
+  return true;
+}
+
+bool OverlapAll(float3 pos, float3 dir, bool detectBackface, out Hit hit) {
+  uint trigsCount, _;
+  triangles.GetDimensions(trigsCount, _);
+
+  hit.dist = FLOAT_MAX;
+
+  for (uint i = 0; i < trigsCount; i++) {
+    Hit temp;
+    if (Overlap(pos, dir, hit.dist, i, false, temp))
+      hit = temp;
+  }
+
+  return hit.dist < FLOAT_MAX;
+}
+
+void SampleRandomLight(float3 pos, inout uint seed, out float3 color,
+                       out float pdf) {
+  color = 0.0;
+  pdf = EPS;
+
+  uint emissiveCount, _;
+  emissiveInfo.GetDimensions(emissiveCount, _);
+
+  uint modelIndex = randInt(0, emissiveCount, seed);
+
+  EmissiveInfo info = emissiveInfo[modelIndex];
+
+  int trigIndex = info.trigIndex + randInt(0, info.trigCount, seed);
+  Trig trig = triangles[trigIndex];
+  float4x4 mat = matrices[trig.modelIndex];
+  float3 a = mul(mat, float4(vertices[trig.indA], 1.0));
+  float3 b = mul(mat, float4(vertices[trig.indB], 1.0));
+  float3 c = mul(mat, float4(vertices[trig.indC], 1.0));
+
+  float r1 = rand(seed);
+  float r2 = rand(seed);
+
+  if (r1 + r2 > 1.0) {
+    r1 = 1.0 - r1;
+    r2 = 1.0 - r2;
+  }
+
+  float3 pointOnTrig = a * r1 + b * r2 + c * (1.0 - r1 - r2);
+  float3 delta = pointOnTrig - pos;
+
+  if (dot(cross(b - a, c - b), delta) > 0.0)
+    return;
+
+  float distToPoint = max(length(delta), EPS);
+  float3 dirToPoint = delta / distToPoint;
+
+  Hit hit;
+  if (!OverlapAll(pos, dirToPoint, false, hit))
+    return;
+
+  if (hit.dist < distToPoint)
+    return;
+
+  Mat material = materials[modelIndex];
+
+  float3 emission = material.emission * material.emissionStrength;
+  float gFactor = dot(-dirToPoint, hit.norm) / max(hit.dist * hit.dist, 1.0);
+  float area = 0.5 * length(cross(b - a, c - b));
+
+  color = emission * gFactor;
+  pdf = (1.0 / emissiveCount) * (1.0 / info.trigCount) * (1.0 / area);
+}
+
+// WARNING:  сделать так, что в Overlap проверяется  сечение с бекфейсом в
+// а не игнорировать, нужно только менять в hit ы
+//
+
+float3 Trace(float3 pos, float3 dir, inout uint seed) {
+  float3 rayColor = 1.0;
+  float3 accum = 0.0;
+
+  for (int i = 0; i < maxBounces; i++) {
+    Hit hit;
+    if (!OverlapAll(pos, dir, false, hit))
+      break;
+
+    Mat material = materials[hit.modelIndex];
+
+    bool isGlossy = rand(seed) < material.glossy;
+
+    float directPdf =
+        1.0 / (isGlossy
+                   ? SEMISPHERE_AREA
+                   : max(SEMISPHERE_AREA *
+                             (1.0 - cos(0.5 * PI * (1.0 - material.smooth))),
+                         EPS));
+
+    float3 indirectLight;
+    float indirectPdf;
+    SampleRandomLight(hit.pos + hit.norm * EPS, seed, indirectLight,
+                      indirectPdf);
+
+    float weightDirect = directPdf / (directPdf + indirectPdf);
+    float weightIndirect = 1.0 - weightDirect;
+
+    float gFactor = dot(-dir, hit.norm) / max(hit.dist * hit.dist, 1.0);
+    float3 emission = gFactor * material.emission * material.emissionStrength;
+
+    float3 light = emission * weightDirect +
+                   (isGlossy ? material.glossyColor : material.color) *
+                       indirectLight * weightIndirect;
+
+    accum += rayColor * light;
+
+    rayColor *= isGlossy ? material.glossyColor : material.color;
+
+    pos = hit.pos + hit.norm * EPS;
+    dir = isGlossy
+              ? randVec(hit.norm, 1.0, seed)
+              : reflect(dir, randVec(hit.norm, 1.0 - material.smooth, seed));
+    if (dot(dir, hit.norm) < 0.0)
+      dir = -dir;
+  }
+
+  return accum;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id: SV_DispatchThreadID) {
+  if (id.x >= resolution.x || id.y >= resolution.y)
+    return;
+
+  uint seed = comb_hash(id.y * resolution.x + id.x, frameIndex);
+  float3 pos = cameraPosition;
+
+  float3 total = 0.0;
+  for (int i = 0; i < samples; i++) {
+    float3 dir = normalize(mul(
+        cameraMatrix, float4(id.x + rand(seed), id.y + rand(seed), 1.0, 1.0)));
+    total += Trace(pos, dir, seed);
+  }
+  total *= 1.0 / samples;
+
+  float3 col = (result[id.xy] * frameIndex + total) / (frameIndex + 1);
+  result[id.xy] = float4(col, 1.0);
+}
